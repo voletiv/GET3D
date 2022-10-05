@@ -164,7 +164,6 @@ def parse_comma_separated_list(s):
 @click.option('--inference_compute_fid', help='inference to generate interpolation results', metavar='BOOL', type=bool, default=False, show_default=False)
 @click.option('--inference_generate_geo', help='inference to generate geometry points', metavar='BOOL', type=bool, default=False, show_default=False)
 ### Configs for dataset
-
 @click.option('--data', help='Path to the Training data Images', metavar='[DIR]', type=str, default='./tmp')
 @click.option('--camera_path', help='Path to the camera root', metavar='[DIR]', type=str, default='./tmp')
 @click.option('--img_res', help='The resolution of image', metavar='INT', type=click.IntRange(min=1), default=1024)
@@ -245,51 +244,52 @@ def main(**kwargs):
         c.training_set_kwargs.split = 'test'
     c.training_set_kwargs.use_labels = opts.cond
     c.training_set_kwargs.xflip = False
+
     # Hyperparameters & settings.p
     c.G_kwargs.one_3d_generator = opts.one_3d_generator
     c.G_kwargs.n_implicit_layer = opts.n_implicit_layer
     c.G_kwargs.deformation_multiplier = opts.deformation_multiplier
     c.resume_pretrain = opts.resume_pretrain
-    c.D_reg_interval = opts.d_reg_interval
     c.G_kwargs.use_style_mixing = opts.use_style_mixing
     c.G_kwargs.dmtet_scale = opts.dmtet_scale
     c.G_kwargs.feat_channel = opts.feat_channel
     c.G_kwargs.mlp_latent_channel = opts.mlp_latent_channel
     c.G_kwargs.tri_plane_resolution = opts.tri_plane_resolution
     c.G_kwargs.n_views = opts.n_views
-
+    c.G_kwargs.tet_res = opts.tet_res
     c.G_kwargs.render_type = opts.render_type
     c.G_kwargs.use_tri_plane = opts.use_tri_plane
-    c.D_kwargs.data_camera_mode = opts.data_camera_mode
-    c.D_kwargs.add_camera_cond = opts.add_camera_cond
-
-    c.G_kwargs.tet_res = opts.tet_res
-
     c.G_kwargs.geometry_type = opts.geometry_type
-    c.num_gpus = opts.gpus
-    c.batch_size = opts.batch
-    c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
     # c.G_kwargs.geo_pos_enc = opts.geo_pos_enc
     c.G_kwargs.data_camera_mode = opts.data_camera_mode
     c.G_kwargs.channel_base = c.D_kwargs.channel_base = opts.cbase
     c.G_kwargs.channel_max = c.D_kwargs.channel_max = opts.cmax
-
     c.G_kwargs.mapping_kwargs.num_layers = 8
+    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
 
+    c.D_kwargs.data_camera_mode = opts.data_camera_mode
+    c.D_kwargs.add_camera_cond = opts.add_camera_cond
+    c.D_reg_interval = opts.d_reg_interval
+    c.D_opt_kwargs.lr = opts.dlr
     c.D_kwargs.architecture = opts.d_architecture
     c.D_kwargs.block_kwargs.freeze_layers = opts.freezed
     c.D_kwargs.epilogue_kwargs.mbstd_group_size = opts.mbstd_group
+
     c.loss_kwargs.gamma_mask = opts.gamma if opts.gamma_mask == 0.0 else opts.gamma_mask
     c.loss_kwargs.r1_gamma = opts.gamma
-    c.G_opt_kwargs.lr = (0.002 if opts.cfg == 'stylegan2' else 0.0025) if opts.glr is None else opts.glr
-    c.D_opt_kwargs.lr = opts.dlr
+
+    c.num_gpus = opts.gpus
+    c.batch_size = opts.batch
+    c.batch_gpu = opts.batch_gpu or opts.batch // opts.gpus
+
     c.metrics = opts.metrics
     c.total_kimg = opts.kimg
     c.kimg_per_tick = opts.tick
     c.image_snapshot_ticks = c.network_snapshot_ticks = opts.snap
     c.random_seed = c.training_set_kwargs.random_seed = opts.seed
     c.data_loader_kwargs.num_workers = opts.workers
-    c.network_snapshot_ticks = 200
+    # c.network_snapshot_ticks = 200
+
     # Sanity checks.
     if c.batch_size % c.num_gpus != 0:
         raise click.ClickException('--batch must be a multiple of --gpus')

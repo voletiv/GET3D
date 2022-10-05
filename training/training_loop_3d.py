@@ -8,20 +8,74 @@
 
 """Main training loop."""
 
-import os
 import copy
+import datetime
+import dnnlib
 import json
 import numpy as np
+import os
+import psutil
 import torch
-import dnnlib
 from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
 from metrics import metric_main
 import nvdiffrast.torch as dr
+import sys
 import time
 from training.inference_utils import save_image_grid, save_visualization
+
+
+
+def get_time():
+    curr_time = time.time()
+    curr_time_str = datetime.datetime.fromtimestamp(curr_time).strftime('%Y-%m-%d %H:%M:%S')
+    return curr_time_str
+    # elapsed = str(datetime.timedelta(seconds=(curr_time - self.start_time)))
+    # return curr_time_str, elapsed
+
+
+def get_proc_mem():
+    return psutil.Process(os.getpid()).memory_info().rss /1024**3
+
+
+def get_GPU_mem():
+    try:
+        num = torch.cuda.device_count()
+        mem, mems = 0, []
+        for i in range(num):
+            mem_free, mem_total = torch.cuda.mem_get_info(i)
+            mems.append(int(((mem_total - mem_free)/1024**3)*1000)/1000)
+            mem += mems[-1]
+        return mem, mems
+    except:
+        try:
+            def get_gpu_memory_map():
+                import subprocess
+                """Get the current gpu usage.
+
+                Returns
+                -------
+                usage: dict
+                    Keys are device ids as integers.
+                    Values are memory usage as integers in MB.
+                """
+                result = subprocess.check_output(
+                    [
+                        'nvidia-smi', '--query-gpu=memory.used',
+                        '--format=csv,nounits,noheader'
+                    ], encoding='utf-8')
+                # Convert lines into a dictionary
+                gpu_memory = [int(x) for x in result.strip().split('\n')]
+                gpu_memory_map = dict(zip(range(len(gpu_memory)), gpu_memory))
+                return gpu_memory_map
+            mems = get_gpu_memory_map()
+            mems = [int(mems[k]/1024*1000)/1000 for k in mems]
+            mem = int(sum([m for m in mems])*1000)/1000
+            return mem, mems
+        except:
+            return 0, "CPU"
 
 
 # ----------------------------------------------------------------------------
@@ -106,6 +160,7 @@ def training_loop(
         inference_vis=False,  # Whether running inference or not.
         detect_anomaly=False,
         resume_pretrain=None,
+        time_profile=False,
 ):
     from torch_utils.ops import upfirdn2d
     from torch_utils.ops import bias_act
@@ -223,7 +278,11 @@ def training_loop(
         masks = np.stack(masks)
         images = np.concatenate((images, masks[:, np.newaxis, :, :].repeat(3, axis=1) * 255.0), axis=-1)
         if not inference_vis:
-            save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
+            try:
+                save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
+            except:
+                e = sys.exc_info()[0]
+                print("ERROR:", e)
         torch.manual_seed(1234)
         grid_z = torch.randn([images.shape[0], G.z_dim], device=device).split(1)  # This one is the latent code for shape generation
         grid_c = torch.ones(images.shape[0], device=device).split(1)  # This one is not used, just for the compatiable with the code structure.
@@ -259,9 +318,11 @@ def training_loop(
 
     # Training Iterations
     while True:
+
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c, real_mask = next(training_set_iterator)
+            tick_dataload_time = time.time()
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1)
             real_mask = real_mask.to(device).to(torch.float32).unsqueeze(dim=1)
             real_mask = (real_mask > 0).float()
@@ -274,7 +335,12 @@ def training_loop(
                          range(len(phases) * (batch_size // num_gpus))]
             all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size // num_gpus)]
+
+        tick_data_time = time.time()
         optim_step += 1
+
+        tick_grad_times, tick_opt_times = [], []
+        tick_runG_times, tick_runD_times, tick_backward_times, tick_runD_time2s, tick_grad_time2s, tick_backward_time2s = [], [], [], [], [], []
         # Execute training phases.
         for phase, phase_gen_z, phase_gen_c in zip(phases, all_gen_z, all_gen_c):
             if batch_idx % phase.interval != 0:
@@ -289,6 +355,8 @@ def training_loop(
                     phase=phase.name, real_img=real_img, real_c=real_c, gen_z=gen_z, gen_c=gen_c,
                     gain=phase.interval, cur_nimg=cur_nimg)
             phase.module.requires_grad_(False)
+
+            tick_grad_times.append(time.time())
 
             # Update weights.
             with torch.autograd.profiler.record_function(phase.name + '_opt'):
@@ -311,9 +379,12 @@ def training_loop(
                         param.grad = grad.reshape(param.shape)
                 phase.opt.step()
 
+            tick_opt_times.append(time.time())
+
             # Phase done.
             if phase.end_event is not None:
                 phase.end_event.record(torch.cuda.current_stream(device))
+
         # Update G_ema.
         with torch.autograd.profiler.record_function('Gema'):
             ema_nimg = ema_kimg * 1000
@@ -348,8 +419,18 @@ def training_loop(
         fields += [
             f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
         fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
+        fields += [f"sec/dataload {training_stats.report0('Timing/sec_per_dataload', tick_dataload_time - tick_start_time):<7.1f}"]
+        fields += [f"sec/data {training_stats.report0('Timing/sec_per_data', tick_data_time - tick_start_time):<7.1f}"]
+        t0 = tick_data_time
+        for i, (g_t, o_t) in enumerate(zip(tick_grad_times, tick_opt_times)):
+            fields += [f"sec/grad {training_stats.report0('Timing/sec_per_grad{i}', g_t - t0):<7.3f}"]
+            fields += [f"sec/opt {training_stats.report0('Timing/sec_per_opt{i}', o_t - g_t):<7.3f}"]
+            t0 = o_t
 
         if rank == 0:
+            fields = [get_time()] + fields + [f"mem {get_proc_mem():.03f}GB"]
+            mem, mems = get_GPU_mem()
+            fields += [f"GPUmem {mem:.03f}GB {mems}"]
             print(' '.join(fields))
 
         if detect_anomaly:
@@ -366,14 +447,18 @@ def training_loop(
                 not detect_anomaly):
             with torch.no_grad():
                 print('==> start visualization')
-                save_visualization(
-                    G_ema, grid_z, grid_c, run_dir, cur_nimg, grid_size, cur_tick,
-                    image_snapshot_ticks,
-                    save_all=(cur_tick % (image_snapshot_ticks * 4) == 0) and training_set.resolution < 512,
-                )
+                try:
+                    save_visualization(
+                        G_ema, grid_z, grid_c, run_dir, cur_nimg, grid_size, cur_tick,
+                        image_snapshot_ticks,
+                        save_all=(cur_tick % (image_snapshot_ticks * 4) == 0) and training_set.resolution < 512,
+                    )
+                except:
+                    e = sys.exc_info()[0]
+                    print("ERROR:", e)
                 print('==> saved visualization')
 
-            # Save network snapshot.
+        # Save network snapshot.
         snapshot_pkl = None
         snapshot_data = None
         if (network_snapshot_ticks is not None) and (done or cur_tick % network_snapshot_ticks == 0) and not detect_anomaly:  # and (cur_tick != 0 or resume_pretrain is not None):  ###########
@@ -390,7 +475,11 @@ def training_loop(
             if rank == 0:
                 all_model_dict = {'G': snapshot_data['G'].state_dict(), 'G_ema': snapshot_data['G_ema'].state_dict(),
                                   'D': snapshot_data['D'].state_dict()}
-                torch.save(all_model_dict, snapshot_pkl.replace('.pkl', '.pt'))
+                try:
+                    torch.save(all_model_dict, snapshot_pkl.replace('.pkl', '.pt'))
+                except:
+                    e = sys.exc_info()[0]
+                    print("ERROR:", e)
 
         # Evaluate metrics.
         if (snapshot_data is not None) and (len(metrics) > 0):
@@ -428,16 +517,24 @@ def training_loop(
         timestamp = time.time()
         if stats_jsonl is not None:
             fields = dict(stats_dict, timestamp=timestamp)
-            stats_jsonl.write(json.dumps(fields) + '\n')
-            stats_jsonl.flush()
+            try:
+                stats_jsonl.write(json.dumps(fields) + '\n')
+                stats_jsonl.flush()
+            except:
+                e = sys.exc_info()[0]
+                print("ERROR:", e)
         if stats_tfevents is not None:
             global_step = int(cur_nimg / 1e3)
             walltime = timestamp - start_time
-            for name, value in stats_dict.items():
-                stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
-            for name, value in stats_metrics.items():
-                stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
-            stats_tfevents.flush()
+            try:
+                for name, value in stats_dict.items():
+                    stats_tfevents.add_scalar(name, value.mean, global_step=global_step, walltime=walltime)
+                for name, value in stats_metrics.items():
+                    stats_tfevents.add_scalar(f'Metrics/{name}', value, global_step=global_step, walltime=walltime)
+                stats_tfevents.flush()
+            except:
+                e = sys.exc_info()[0]
+                print("ERROR:", e)
         if progress_fn is not None:
             progress_fn(cur_nimg // 1000, total_kimg)
 

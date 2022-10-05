@@ -427,7 +427,7 @@ class DMTETSynthesisNetwork(torch.nn.Module):
         camera_radius = 1.2  # align with what ww did in blender
         camera_r = torch.zeros(n_camera, 1, device=self.device) + camera_radius
         camera_phi = torch.zeros(n_camera, 1, device=self.device) + (90.0 - 15.0) / 90.0 * 0.5 * math.pi
-        camera_theta = torch.range(0, n_camera - 1, device=self.device).unsqueeze(dim=-1) / n_camera * math.pi * 2.0
+        camera_theta = torch.arange(0, n_camera, device=self.device).unsqueeze(dim=-1) / n_camera * math.pi * 2.0
         camera_theta = -camera_theta
         world2cam_matrix, camera_origin, _, _, _ = create_camera_from_angle(
             camera_phi, camera_theta, camera_r, device=self.device)
